@@ -1,8 +1,9 @@
-# carrier_reco_hub.py
+# streamlit_app.py
 # Multi-product Streamlit app (Last Mile ready).
-# - Comparative mode now adds Δ in Reasons.
+# - Comparative mode: ANY-per-metric (your original), adds Δ in Reasons.
+# - Absolute mode: now uses a FORM with decimal inputs (%.2f), no cursor jumping; 'Apply thresholds' to commit.
 # - Drops 'Unnamed: 0' and blank columns.
-# - Excel writer: try openpyxl/xlsxwriter; if neither is installed, fall back to CSV downloads.
+# - Excel writer: try openpyxl/xlsxwriter; fallback to CSV downloads if neither is available.
 
 import streamlit as st
 import pandas as pd
@@ -35,26 +36,8 @@ PRODUCTS = {
         "carrier_col": "Carrier Name",
     },
     # Fill when ready:
-    "Parcel": {
-        "metrics": [
-            # ("On-Time Delivery %", "higher", "percent"),
-            # ("First Attempt Delivery %", "higher", "percent"),
-            # ("Damage Rate %", "lower", "percent"),
-            # ("Avg Transit Days", "lower", "number"),
-        ],
-        "volume_col": "Volume",
-        "carrier_col": "Carrier Name",
-    },
-    "Ocean": {
-        "metrics": [
-            # ("On-Time Departure %", "higher", "percent"),
-            # ("On-Time Arrival %", "higher", "percent"),
-            # ("Roll-Over Rate %", "lower", "percent"),
-            # ("Avg Dwell Days", "lower", "number"),
-        ],
-        "volume_col": "Volume",
-        "carrier_col": "Carrier Name",
-    },
+    "Parcel": {"metrics": [], "volume_col": "Volume", "carrier_col": "Carrier Name"},
+    "Ocean":  {"metrics": [], "volume_col": "Volume", "carrier_col": "Carrier Name"},
 }
 
 # =========================
@@ -88,12 +71,25 @@ customer_file = st.file_uploader("Upload CUSTOMER carrier dataset (already used 
 st.header("2) Parameters")
 use_absolute = st.checkbox("Use absolute thresholds mode (override comparative logic)", value=False)
 allow_equal_abs = st.checkbox("Absolute mode: allow equals to pass", value=True, help="When ON, ≥ for higher metrics and ≤ for lower metrics.")
-num_suggestions = st.number_input("How many top suggestions do you want?", min_value=1, value=10, step=1)
+num_suggestions = st.number_input("How many top suggestions do you want?", min_value=1, value=10, step=1, format="%d")
 
 auto_run = st.checkbox("Auto-run on changes", value=True)
 run_clicked = st.button("Run")
 
+# =========================
+# Absolute-mode form state init (for smooth typing)
+# =========================
+if use_absolute and metric_catalog and "abs_state_initialized" not in st.session_state:
+    for name, direction, vtype in metric_catalog:
+        # defaults: 95.00 for percent, 60.00 for number
+        default_val = 95.00 if vtype == "percent" else 60.00
+        st.session_state.setdefault(f"abs_chk_{name}", False)
+        st.session_state.setdefault(f"abs_thr_{name}", float(default_val))
+    st.session_state["abs_state_initialized"] = True
+
+# =========================
 # Comparative (default) UI
+# =========================
 if not use_absolute:
     metric_labels = [f"{i+1}. {name} ({direction})" for i, (name, direction, _vt) in enumerate(metric_catalog)]
     st.markdown("**Select metric priority order.** Enter numbers in comma-separated order (e.g., `1,2,14`):")
@@ -107,26 +103,45 @@ if not use_absolute:
         st.error("Invalid metric order input; use numbers like 1,2,14")
     selected_metrics = [(metric_catalog[i][0], metric_catalog[i][1]) for i in selected_indices if 0 <= i < len(metric_catalog)]
 else:
-    # Absolute mode UI
+    # ===== Absolute thresholds mode: FORM (no reruns while typing) =====
     st.markdown("**Absolute thresholds mode** — select metrics and set required thresholds.")
-    abs_selected, abs_thresholds = [], {}
-    if metric_catalog:
+    with st.form("abs_form", clear_on_submit=False):
         left, right = st.columns(2)
         half = (len(metric_catalog) + 1) // 2
         for i, (name, direction, vtype) in enumerate(metric_catalog):
             container = left if i < half else right
             with container:
-                chk = st.checkbox(f"{name} ({'higher' if direction=='higher' else 'lower'} is better)", key=f"abs_{name}")
-                if chk:
-                    if vtype == "percent":
-                        default_val = 95.0
-                    else:
-                        default_val = 60.0 if any(k in name for k in ("Latency", "Transit", "Days")) else 0.0
-                    thr = st.number_input(f"Threshold for {name}", value=float(default_val), step=1.0, key=f"thr_{name}")
+                st.checkbox(
+                    f"{name} ({'higher' if direction=='higher' else 'lower'} is better)",
+                    key=f"abs_chk_{name}"
+                )
+                # Decimal inputs with two fixed decimals; step=0.01; no rerun until submit
+                st.number_input(
+                    f"Threshold • {name}",
+                    value=float(st.session_state.get(f"abs_thr_{name}", 95.00 if vtype=='percent' else 60.00)),
+                    step=0.01,
+                    format="%.2f",
+                    key=f"abs_thr_{name}"
+                )
+        applied = st.form_submit_button("Apply thresholds")
+        if applied:
+            # Store consolidated selections in session_state
+            abs_selected = []
+            abs_thresholds = {}
+            for name, direction, vtype in metric_catalog:
+                if st.session_state.get(f"abs_chk_{name}", False):
                     abs_selected.append((name, direction))
-                    abs_thresholds[name] = float(thr)
-    selected_metrics = abs_selected
-    metric_thresholds = abs_thresholds
+                    abs_thresholds[name] = float(st.session_state.get(f"abs_thr_{name}", 0.0))
+            st.session_state["abs_selected"] = abs_selected
+            st.session_state["abs_thresholds"] = abs_thresholds
+
+    # Read latest applied state (if none yet, fall back to current widgets’ state)
+    selected_metrics = st.session_state.get("abs_selected", [])
+    metric_thresholds = st.session_state.get(
+        "abs_thresholds",
+        {name: float(st.session_state.get(f"abs_thr_{name}", 95.00 if vt=='percent' else 60.00))
+         for name, _d, vt in metric_catalog if st.session_state.get(f"abs_chk_{name}", False)}
+    )
 
 st.divider()
 
@@ -195,7 +210,6 @@ def to_excel_bytes_or_none(suggestions_df: pd.DataFrame, legend_df: pd.DataFrame
     Returns (bytes, mime) if successful, else (None, None) to indicate fallback to CSV is needed.
     """
     output = BytesIO()
-    # prefer openpyxl, then xlsxwriter
     for engine in ("openpyxl", "xlsxwriter"):
         if engine_available(engine):
             try:
@@ -205,19 +219,13 @@ def to_excel_bytes_or_none(suggestions_df: pd.DataFrame, legend_df: pd.DataFrame
                 output.seek(0)
                 return output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             except Exception:
-                # try next engine
                 output.seek(0)
                 output.truncate(0)
                 continue
-    return None, None  # no engine available
+    return None, None
 
 # ===== Comparative mode (ANY-per-metric, with Δ) =====
 def make_output_comparative(master_df, customer_df, metrics, suggestion_count, carrier_col_name):
-    """
-    metrics: list[(col, direction)] in priority order
-    Logic: candidate passes each metric if it beats/ties ANY customer carrier on that metric.
-    Reasons include Δ vs each matched customer per metric.
-    """
     if not metrics:
         return pd.DataFrame()
 
@@ -254,7 +262,6 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
                         continue
                     is_better = (sugg_val > cust_val) if direction == "higher" else (sugg_val < cust_val)
                     is_equal = abs(sugg_val - cust_val) < 1e-6
-                    # Δ = improvement vs customer
                     delta = (sugg_val - cust_val) if direction == "higher" else (cust_val - sugg_val)
                     delta_str = f"{delta:+.2f}" if pd.notna(delta) else "NA"
                     tag = "(B)" if is_better else ("(E)" if is_equal else "")
@@ -286,7 +293,7 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
     df = drop_unwanted_columns(df)
     return df
 
-# ===== Absolute thresholds mode (also includes Δ) =====
+# ===== Absolute thresholds mode (includes Δ) =====
 def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, thresholds, allow_equal, suggestion_count, carrier_col_name):
     if not metrics_with_dir:
         return pd.DataFrame()
@@ -401,7 +408,7 @@ def compute_and_show():
         return
 
     if use_absolute and len(selected_metrics) == 0:
-        st.info("Select at least one metric and set thresholds in Absolute mode.")
+        st.info("Select metrics and click 'Apply thresholds' in Absolute mode.")
         return
     if (not use_absolute) and len(selected_metrics) == 0:
         st.info("Enter a valid metric priority order with at least one metric.")
@@ -488,18 +495,5 @@ with st.expander("How to add/modify a product (Parcel/Ocean/etc.)"):
    - `value_type`: `"percent"` (strips `%` and coerces) or `"number"`
 3. Ensure your CSVs use the **exact column names** from `metrics` and include `Carrier Name` (or change `carrier_col`).
 4. (Optional) Set `volume_col` if you want it cleaned for consistency or future sorting.
-
-**Example (Parcel):**
-```python
-"Parcel": {
-    "metrics": [
-        ("On-Time Delivery %", "higher", "percent"),
-        ("First Attempt Delivery %", "higher", "percent"),
-        ("Damage Rate %", "lower", "percent"),
-        ("Avg Transit Days", "lower", "number"),
-    ],
-    "volume_col": "Volume",
-    "carrier_col": "Carrier Name",
-}
 """
-)
+    )
