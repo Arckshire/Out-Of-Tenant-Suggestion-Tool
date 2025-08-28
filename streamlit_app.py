@@ -1,9 +1,13 @@
 # carrier_reco_hub.py
-# Multi-product Streamlit app (Last Mile ready). Adds Δ in comparative mode, removes Unnamed columns, robust Excel writer.
+# Multi-product Streamlit app (Last Mile ready).
+# - Comparative mode now adds Δ in Reasons.
+# - Drops 'Unnamed: 0' and blank columns.
+# - Excel writer: try openpyxl/xlsxwriter; if neither is installed, fall back to CSV downloads.
 
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+import importlib.util
 import re
 
 # =========================
@@ -145,16 +149,13 @@ def drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
     cols_to_drop = []
     for c in df.columns:
-        if c is None:
-            cols_to_drop.append(c)
-            continue
-        c_str = str(c)
+        c_str = "" if c is None else str(c)
         if c_str.strip() == "":
             cols_to_drop.append(c)
         if re.match(r"^Unnamed:?\s*0*$", c_str):
             cols_to_drop.append(c)
     if cols_to_drop:
-        df = df.drop(columns=cols_to_drop, errors="ignore")
+        df = df.drop(columns=list(set(cols_to_drop)), errors="ignore")
     return df
 
 def prep(df: pd.DataFrame, product_cfg: dict) -> pd.DataFrame:
@@ -185,40 +186,41 @@ def prep(df: pd.DataFrame, product_cfg: dict) -> pd.DataFrame:
     df = drop_unwanted_columns(df)
     return df
 
-def to_excel_bytes(suggestions_df: pd.DataFrame, legend_df: pd.DataFrame) -> bytes:
-    output = BytesIO()
-    # Try openpyxl first (commonly available). Fallback to xlsxwriter if installed.
-    engine = None
-    for candidate in ("openpyxl", "xlsxwriter"):
-        try:
-            with pd.ExcelWriter(output, engine=candidate) as writer:
-                drop_unwanted_columns(suggestions_df).to_excel(writer, index=False, sheet_name="Suggestions")
-                drop_unwanted_columns(legend_df).to_excel(writer, index=False, sheet_name="Legend")
-            engine = candidate
-            break
-        except Exception:
-            output.seek(0)
-            output.truncate(0)
-            continue
-    if engine is None:
-        # Last resort: let pandas pick (may raise a clearer error in your env)
-        with pd.ExcelWriter(output) as writer:
-            drop_unwanted_columns(suggestions_df).to_excel(writer, index=False, sheet_name="Suggestions")
-            drop_unwanted_columns(legend_df).to_excel(writer, index=False, sheet_name="Legend")
-    return output.getvalue()
+def engine_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
 
-# ===== Comparative mode (ANY-per-metric, now with Δ) =====
+def to_excel_bytes_or_none(suggestions_df: pd.DataFrame, legend_df: pd.DataFrame):
+    """
+    Try to create an Excel file in-memory.
+    Returns (bytes, mime) if successful, else (None, None) to indicate fallback to CSV is needed.
+    """
+    output = BytesIO()
+    # prefer openpyxl, then xlsxwriter
+    for engine in ("openpyxl", "xlsxwriter"):
+        if engine_available(engine):
+            try:
+                with pd.ExcelWriter(output, engine=engine) as writer:
+                    drop_unwanted_columns(suggestions_df).to_excel(writer, index=False, sheet_name="Suggestions")
+                    drop_unwanted_columns(legend_df).to_excel(writer, index=False, sheet_name="Legend")
+                output.seek(0)
+                return output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            except Exception:
+                # try next engine
+                output.seek(0)
+                output.truncate(0)
+                continue
+    return None, None  # no engine available
+
+# ===== Comparative mode (ANY-per-metric, with Δ) =====
 def make_output_comparative(master_df, customer_df, metrics, suggestion_count, carrier_col_name):
     """
     metrics: list[(col, direction)] in priority order
-    Logic: For each suggested (master-not-in-customer) row, it must pass each metric by
-           being >= (or <=) at least one customer carrier on that metric (ANY).
-    Now: Reasons include Δ vs each matched customer per metric.
+    Logic: candidate passes each metric if it beats/ties ANY customer carrier on that metric.
+    Reasons include Δ vs each matched customer per metric.
     """
     if not metrics:
         return pd.DataFrame()
 
-    # ensure no unwanted columns propagate
     master_df = drop_unwanted_columns(master_df)
     customer_df = drop_unwanted_columns(customer_df)
 
@@ -252,9 +254,8 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
                         continue
                     is_better = (sugg_val > cust_val) if direction == "higher" else (sugg_val < cust_val)
                     is_equal = abs(sugg_val - cust_val) < 1e-6
-                    # Δ definition: improvement relative to customer
+                    # Δ = improvement vs customer
                     delta = (sugg_val - cust_val) if direction == "higher" else (cust_val - sugg_val)
-                    # keep sign and round
                     delta_str = f"{delta:+.2f}" if pd.notna(delta) else "NA"
                     tag = "(B)" if is_better else ("(E)" if is_equal else "")
                     if tag:
@@ -277,17 +278,15 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
         return pd.DataFrame()
 
     df = pd.DataFrame(suggested).head(suggestion_count)
-    # Drop any unwanted cols before final formatting
     df = drop_unwanted_columns(df)
     df.insert(0, "SL No", range(1, len(df) + 1))
     for col in df.columns:
         if str(col).lower().startswith("carrier"):
             df[col] = df[col].astype(str).str.title()
-    # Final sweep
     df = drop_unwanted_columns(df)
     return df
 
-# ===== Absolute thresholds mode (unchanged behavior, already includes Δ) =====
+# ===== Absolute thresholds mode (also includes Δ) =====
 def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, thresholds, allow_equal, suggestion_count, carrier_col_name):
     if not metrics_with_dir:
         return pd.DataFrame()
@@ -401,7 +400,6 @@ def compute_and_show():
         st.info("Upload both files to continue.")
         return
 
-    # metric selection checks
     if use_absolute and len(selected_metrics) == 0:
         st.info("Select at least one metric and set thresholds in Absolute mode.")
         return
@@ -442,7 +440,6 @@ def compute_and_show():
     if output_df.empty:
         st.warning("No suggestions found with the selected settings.")
     else:
-        # final sweep before showing/downloading
         output_df = drop_unwanted_columns(output_df)
         st.dataframe(output_df, use_container_width=True)
 
@@ -455,13 +452,29 @@ def compute_and_show():
         st.subheader("Legend")
         st.table(legend_df)
 
-        data = to_excel_bytes(output_df, legend_df)
-        st.download_button(
-            "Download Suggestions (Excel)",
-            data,
-            file_name=f"{product.replace(' ','_')}_Top_{num_suggestions}_Suggestions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # Try Excel; if not possible, fall back to CSVs
+        excel_bytes, mime = to_excel_bytes_or_none(output_df, legend_df)
+        if excel_bytes is not None:
+            st.download_button(
+                "Download Suggestions (Excel)",
+                excel_bytes,
+                file_name=f"{product.replace(' ','_')}_Top_{num_suggestions}_Suggestions.xlsx",
+                mime=mime
+            )
+        else:
+            st.warning("Excel engines not available in this environment. Providing CSV downloads instead.")
+            st.download_button(
+                "Download Suggestions (CSV)",
+                output_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{product.replace(' ','_')}_Suggestions.csv",
+                mime="text/csv"
+            )
+            st.download_button(
+                "Download Legend (CSV)",
+                legend_df.to_csv(index=False).encode("utf-8"),
+                file_name="Legend.csv",
+                mime="text/csv"
+            )
 
 if auto_run or run_clicked:
     compute_and_show()
