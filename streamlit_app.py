@@ -1,19 +1,14 @@
 # carrier_reco_hub.py
-# Streamlit multi-product carrier suggestion hub (Last Mile, Parcel, Ocean, etc.)
-# - Default: comparative cascading logic (your current LM behavior)
-# - Toggle: absolute thresholds mode (select metrics & thresholds, allow equals or not)
-# - Config-driven per-product metrics so you can add/modify products easily
+# Multi-product Streamlit app (Last Mile ready). Adds Δ in comparative mode, removes Unnamed columns, robust Excel writer.
 
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+import re
 
 # =========================
 # Product Config (EDIT ME)
 # =========================
-# Define metrics per product. Each metric: (display_name, direction, value_type)
-# direction: "higher" or "lower"
-# value_type: "percent" or "number" (drives cleaning)
 PRODUCTS = {
     "Last Mile": {
         "metrics": [
@@ -32,16 +27,15 @@ PRODUCTS = {
             ("Latency over 72hrs", "lower", "percent"),
             ("Avg Latency Mins", "lower", "number"),
         ],
-        "volume_col": "Volume",         # optional; used for cleaning & potential sorting
-        "carrier_col": "Carrier Name",  # required
+        "volume_col": "Volume",
+        "carrier_col": "Carrier Name",
     },
-    # ==== Fill these when you have the actual schemas ====
+    # Fill when ready:
     "Parcel": {
         "metrics": [
-            # EXAMPLES (replace with real parcel columns):
             # ("On-Time Delivery %", "higher", "percent"),
             # ("First Attempt Delivery %", "higher", "percent"),
-            # ("Damages %", "lower", "percent"),
+            # ("Damage Rate %", "lower", "percent"),
             # ("Avg Transit Days", "lower", "number"),
         ],
         "volume_col": "Volume",
@@ -49,7 +43,6 @@ PRODUCTS = {
     },
     "Ocean": {
         "metrics": [
-            # EXAMPLES (replace with real ocean columns):
             # ("On-Time Departure %", "higher", "percent"),
             # ("On-Time Arrival %", "higher", "percent"),
             # ("Roll-Over Rate %", "lower", "percent"),
@@ -60,24 +53,22 @@ PRODUCTS = {
     },
 }
 
-
 # =========================
-# Streamlit App Shell
+# App Shell
 # =========================
 st.set_page_config(page_title="Carrier Suggestion Hub", layout="wide")
 st.title("Carrier Recommendation Hub")
-st.caption("Pick a product (Last Mile / Parcel / Ocean), upload MASTER and CUSTOMER CSVs, and generate out-of-tenant suggestions.")
+st.caption("Pick a product, upload MASTER & CUSTOMER CSVs, and generate out-of-tenant suggestions.")
 
-# --- Product selection ---
 product = st.selectbox("Choose Product", options=list(PRODUCTS.keys()), index=0)
 cfg = PRODUCTS[product]
 metric_catalog = cfg["metrics"]
 carrier_col = cfg["carrier_col"]
-volume_col = cfg.get("volume_col", None)
+volume_col = cfg.get("volume_col")
 
 st.markdown(f"**Selected Product:** `{product}`")
 if not metric_catalog:
-    st.warning("This product has no metrics configured yet. Edit the `PRODUCTS` config at the top to add metrics.")
+    st.warning("This product has no metrics configured yet. Edit the PRODUCTS config at the top to add metrics.")
 st.divider()
 
 # =========================
@@ -91,20 +82,16 @@ customer_file = st.file_uploader("Upload CUSTOMER carrier dataset (already used 
 # Parameters
 # =========================
 st.header("2) Parameters")
-
-# Mode toggle
 use_absolute = st.checkbox("Use absolute thresholds mode (override comparative logic)", value=False)
 allow_equal_abs = st.checkbox("Absolute mode: allow equals to pass", value=True, help="When ON, ≥ for higher metrics and ≤ for lower metrics.")
-
 num_suggestions = st.number_input("How many top suggestions do you want?", min_value=1, value=10, step=1)
 
 auto_run = st.checkbox("Auto-run on changes", value=True)
 run_clicked = st.button("Run")
 
-# Comparative (default) UI: metric priority order (like your current tool)
+# Comparative (default) UI
 if not use_absolute:
-    # Build display list
-    metric_labels = [f"{i+1}. {name} ({direction})" for i, (name, direction, _vtype) in enumerate(metric_catalog)]
+    metric_labels = [f"{i+1}. {name} ({direction})" for i, (name, direction, _vt) in enumerate(metric_catalog)]
     st.markdown("**Select metric priority order.** Enter numbers in comma-separated order (e.g., `1,2,14`):")
     st.text("\n".join(metric_labels))
     default_order = ",".join(str(i+1) for i in range(min(3, len(metric_catalog)))) if metric_catalog else ""
@@ -116,10 +103,9 @@ if not use_absolute:
         st.error("Invalid metric order input; use numbers like 1,2,14")
     selected_metrics = [(metric_catalog[i][0], metric_catalog[i][1]) for i in selected_indices if 0 <= i < len(metric_catalog)]
 else:
-    # Absolute mode: select metrics + thresholds
+    # Absolute mode UI
     st.markdown("**Absolute thresholds mode** — select metrics and set required thresholds.")
-    abs_selected = []
-    abs_thresholds = {}
+    abs_selected, abs_thresholds = [], {}
     if metric_catalog:
         left, right = st.columns(2)
         half = (len(metric_catalog) + 1) // 2
@@ -128,7 +114,6 @@ else:
             with container:
                 chk = st.checkbox(f"{name} ({'higher' if direction=='higher' else 'lower'} is better)", key=f"abs_{name}")
                 if chk:
-                    # simple defaults: 95 for percent, 60 for latency/transit/days, else 0
                     if vtype == "percent":
                         default_val = 95.0
                     else:
@@ -140,7 +125,6 @@ else:
     metric_thresholds = abs_thresholds
 
 st.divider()
-
 
 # =========================
 # Helpers
@@ -155,45 +139,88 @@ def clean_percent(val):
     except Exception:
         return pd.NA
 
+def drop_unwanted_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove columns like 'Unnamed: 0' and empty/blank-named columns."""
+    if df is None or df.empty:
+        return df
+    cols_to_drop = []
+    for c in df.columns:
+        if c is None:
+            cols_to_drop.append(c)
+            continue
+        c_str = str(c)
+        if c_str.strip() == "":
+            cols_to_drop.append(c)
+        if re.match(r"^Unnamed:?\s*0*$", c_str):
+            cols_to_drop.append(c)
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop, errors="ignore")
+    return df
+
 def prep(df: pd.DataFrame, product_cfg: dict) -> pd.DataFrame:
-    """Standardize columns, strip %, coerce numerics based on value_type."""
+    """Standardize columns, strip %, coerce numerics based on value_type; drop 'Unnamed' cols."""
     df = df.copy()
+    df = drop_unwanted_columns(df)
     df.columns = df.columns.str.strip()
-    # Normalize carrier/volume columns if present
+
     if product_cfg["carrier_col"] in df.columns:
         df[product_cfg["carrier_col"]] = df[product_cfg["carrier_col"]].astype(str).str.strip()
-    if product_cfg.get("volume_col") and product_cfg["volume_col"] in df.columns:
-        c = product_cfg["volume_col"]
-        df[c] = (
-            df[c].astype(str).str.replace(",", "", regex=False)
+
+    vcol = product_cfg.get("volume_col")
+    if vcol and vcol in df.columns:
+        df[vcol] = (
+            df[vcol].astype(str).str.replace(",", "", regex=False)
             .str.extract(r"(\d+\.?\d*)")[0].astype(float)
         )
 
-    # Clean metric columns based on their configured value_type
+    # Clean configured metric columns
     for name, _direction, vtype in product_cfg["metrics"]:
         if name in df.columns:
             if vtype == "percent":
                 df[name] = df[name].apply(clean_percent)
             else:
                 df[name] = pd.to_numeric(df[name], errors="coerce")
+
+    # Also drop any lingering Unnamed/blank after cleaning
+    df = drop_unwanted_columns(df)
     return df
 
 def to_excel_bytes(suggestions_df: pd.DataFrame, legend_df: pd.DataFrame) -> bytes:
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        suggestions_df.to_excel(writer, index=False, sheet_name="Suggestions")
-        legend_df.to_excel(writer, index=False, sheet_name="Legend")
+    # Try openpyxl first (commonly available). Fallback to xlsxwriter if installed.
+    engine = None
+    for candidate in ("openpyxl", "xlsxwriter"):
+        try:
+            with pd.ExcelWriter(output, engine=candidate) as writer:
+                drop_unwanted_columns(suggestions_df).to_excel(writer, index=False, sheet_name="Suggestions")
+                drop_unwanted_columns(legend_df).to_excel(writer, index=False, sheet_name="Legend")
+            engine = candidate
+            break
+        except Exception:
+            output.seek(0)
+            output.truncate(0)
+            continue
+    if engine is None:
+        # Last resort: let pandas pick (may raise a clearer error in your env)
+        with pd.ExcelWriter(output) as writer:
+            drop_unwanted_columns(suggestions_df).to_excel(writer, index=False, sheet_name="Suggestions")
+            drop_unwanted_columns(legend_df).to_excel(writer, index=False, sheet_name="Legend")
     return output.getvalue()
 
-# ===== Comparative mode (your original ANY-per-metric pass with cascading order) =====
+# ===== Comparative mode (ANY-per-metric, now with Δ) =====
 def make_output_comparative(master_df, customer_df, metrics, suggestion_count, carrier_col_name):
     """
     metrics: list[(col, direction)] in priority order
     Logic: For each suggested (master-not-in-customer) row, it must pass each metric by
-           being >= (or <=) at least one customer carrier on that metric (ANY). This matches your current code.
+           being >= (or <=) at least one customer carrier on that metric (ANY).
+    Now: Reasons include Δ vs each matched customer per metric.
     """
     if not metrics:
         return pd.DataFrame()
+
+    # ensure no unwanted columns propagate
+    master_df = drop_unwanted_columns(master_df)
+    customer_df = drop_unwanted_columns(customer_df)
 
     unused = master_df[~master_df[carrier_col_name].str.lower().isin(customer_df[carrier_col_name].str.lower())].copy()
     suggested = []
@@ -201,7 +228,6 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
     for _, sugg in unused.iterrows():
         passes = True
         carrier_to_metrics = {}
-
         for col, direction in metrics:
             if col not in customer_df.columns or pd.isna(sugg.get(col)):
                 passes = False
@@ -209,7 +235,6 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
 
             cust_vals = pd.to_numeric(customer_df[col], errors="coerce")
             sugg_val = pd.to_numeric(sugg[col], errors="coerce")
-
             if pd.isna(sugg_val):
                 passes = False
                 break
@@ -223,11 +248,18 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
                 for ci in customer_df[mask].index:
                     cust_name = customer_df.loc[ci, carrier_col_name]
                     cust_val = pd.to_numeric(customer_df.loc[ci, col], errors="coerce")
-                    if pd.isna(cust_val) or pd.isna(sugg_val):
+                    if pd.isna(cust_val):
                         continue
-                    tag = "(E)" if abs(sugg_val - cust_val) < 1e-6 else ("(B)" if ((sugg_val > cust_val) if direction=="higher" else (sugg_val < cust_val)) else "(E)")
-                    metric_label = f"{col} {tag}"
-                    carrier_to_metrics.setdefault(str(cust_name).title(), []).append(metric_label)
+                    is_better = (sugg_val > cust_val) if direction == "higher" else (sugg_val < cust_val)
+                    is_equal = abs(sugg_val - cust_val) < 1e-6
+                    # Δ definition: improvement relative to customer
+                    delta = (sugg_val - cust_val) if direction == "higher" else (cust_val - sugg_val)
+                    # keep sign and round
+                    delta_str = f"{delta:+.2f}" if pd.notna(delta) else "NA"
+                    tag = "(B)" if is_better else ("(E)" if is_equal else "")
+                    if tag:
+                        metric_label = f"{col} {tag} (Δ {delta_str})"
+                        carrier_to_metrics.setdefault(str(cust_name).title(), []).append(metric_label)
             else:
                 passes = False
                 break
@@ -245,22 +277,23 @@ def make_output_comparative(master_df, customer_df, metrics, suggestion_count, c
         return pd.DataFrame()
 
     df = pd.DataFrame(suggested).head(suggestion_count)
-    df.insert(0, "SL No", range(1, len(df)+1))
+    # Drop any unwanted cols before final formatting
+    df = drop_unwanted_columns(df)
+    df.insert(0, "SL No", range(1, len(df) + 1))
     for col in df.columns:
-        if col.lower().startswith("carrier"):
+        if str(col).lower().startswith("carrier"):
             df[col] = df[col].astype(str).str.title()
+    # Final sweep
+    df = drop_unwanted_columns(df)
     return df
 
-# ===== Absolute thresholds mode =====
+# ===== Absolute thresholds mode (unchanged behavior, already includes Δ) =====
 def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, thresholds, allow_equal, suggestion_count, carrier_col_name):
-    """
-    - Keep only master carriers not already in customer.
-    - Suggested carriers must pass ALL selected thresholds.
-    - Bad customers = those that fail ANY selected threshold.
-    - Reasons show (B)/(E) vs bad customers, with Δ improvement.
-    """
     if not metrics_with_dir:
         return pd.DataFrame()
+
+    master_df = drop_unwanted_columns(master_df)
+    customer_df = drop_unwanted_columns(customer_df)
 
     def pass_threshold(val, thr, direction, allow_eq):
         if pd.isna(val) or pd.isna(thr):
@@ -270,10 +303,8 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
         else:
             return (val < thr) or (allow_eq and val <= thr)
 
-    # Identify unused master carriers
     unused = master_df[~master_df[carrier_col_name].str.lower().isin(customer_df[carrier_col_name].str.lower())].copy()
 
-    # Determine bad customer carriers (fail ANY threshold)
     bad_rows = []
     for _, crow in customer_df.iterrows():
         fail = False
@@ -301,7 +332,6 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
     eps = 1e-9
 
     for _, srow in unused.iterrows():
-        # must pass ALL thresholds
         ok = True
         for col, direction in metrics_with_dir:
             if col not in srow or col not in thresholds:
@@ -315,7 +345,6 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
         if not ok:
             continue
 
-        # Build Reason columns vs bad customers
         carrier_to_reasons = {}
         if not bad_customers.empty:
             for _, brow in bad_customers.iterrows():
@@ -333,7 +362,7 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
                     else:
                         delta = bval - sval
                     if tag:
-                        reasons.append(f"{col} {tag} (Δ {round(float(delta), 2)})")
+                        reasons.append(f"{col} {tag} (Δ {delta:+.2f})")
                 if reasons:
                     cust_name = str(brow.get(carrier_col_name, "")).title()
                     carrier_to_reasons[cust_name] = ", ".join(reasons)
@@ -354,26 +383,25 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
         return pd.DataFrame()
 
     df = pd.DataFrame(suggested_rows).head(suggestion_count)
-    df.insert(0, "SL No", range(1, len(df)+1))
+    df = drop_unwanted_columns(df)
+    df.insert(0, "SL No", range(1, len(df) + 1))
     for col in df.columns:
-        if col.lower().startswith("carrier"):
+        if str(col).lower().startswith("carrier"):
             df[col] = df[col].astype(str).str.title()
+    df = drop_unwanted_columns(df)
     return df
-
 
 # =========================
 # Run
 # =========================
 st.header("3) Generate Suggestions")
 
-ready = master_file is not None and customer_file is not None and metric_catalog is not None
-
 def compute_and_show():
     if master_file is None or customer_file is None:
         st.info("Upload both files to continue.")
         return
 
-    # need selected metrics
+    # metric selection checks
     if use_absolute and len(selected_metrics) == 0:
         st.info("Select at least one metric and set thresholds in Absolute mode.")
         return
@@ -384,7 +412,6 @@ def compute_and_show():
     master_df = prep(pd.read_csv(master_file), cfg)
     customer_df = prep(pd.read_csv(customer_file), cfg)
 
-    # sanity checks
     if carrier_col not in master_df.columns or carrier_col not in customer_df.columns:
         st.error(f"Both files must include a `{carrier_col}` column.")
         return
@@ -396,13 +423,10 @@ def compute_and_show():
     if missing_in_customer:
         st.warning(f"CUSTOMER missing columns (not fatal if not selected): {', '.join(missing_in_customer)}")
 
-    # compute
     with st.spinner("Crunching suggestions..."):
         if not use_absolute:
-            # Comparative: selected_metrics is [(name, direction)]
             output_df = make_output_comparative(master_df, customer_df, selected_metrics, num_suggestions, carrier_col)
         else:
-            # Absolute: selected_metrics is [(name, direction)], thresholds in metric_thresholds
             thresholds = {k: v for k, v in metric_thresholds.items()}
             output_df = make_output_absolute_thresholds(
                 master_df=master_df,
@@ -418,19 +442,19 @@ def compute_and_show():
     if output_df.empty:
         st.warning("No suggestions found with the selected settings.")
     else:
+        # final sweep before showing/downloading
+        output_df = drop_unwanted_columns(output_df)
         st.dataframe(output_df, use_container_width=True)
 
-        # Legend
         legend_rows = [
             ["Column", "Explanation"],
             ["Carrier N", "Customer carrier outperformed (comparative mode) or compared against (absolute mode)."],
-            ["Reason N", "Metrics with tags: (B)=Better, (E)=Equal; Δ shows improvement vs that customer in absolute mode."]
+            ["Reason N", "Metrics with tags: (B)=Better, (E)=Equal; Δ shows improvement vs that customer (positive is better)."]
         ]
         legend_df = pd.DataFrame(legend_rows[1:], columns=legend_rows[0])
         st.subheader("Legend")
         st.table(legend_df)
 
-        # Download
         data = to_excel_bytes(output_df, legend_df)
         st.download_button(
             "Download Suggestions (Excel)",
@@ -439,10 +463,7 @@ def compute_and_show():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# Auto-run or manual run
-if auto_run:
-    compute_and_show()
-elif run_clicked:
+if auto_run or run_clicked:
     compute_and_show()
 
 with st.expander("How to add/modify a product (Parcel/Ocean/etc.)"):
