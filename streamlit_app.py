@@ -148,4 +148,3 @@ def clean_percent(val):
     try:
         if isinstance(val, str):
             return float(val.replace("%", "").replace(",", "").strip())
-        r
