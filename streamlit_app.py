@@ -1,7 +1,7 @@
 # streamlit_app.py
 # Multi-product Streamlit app (Last Mile ready).
 # - Comparative mode: ANY-per-metric (your original), adds Δ in Reasons.
-# - Absolute mode: now uses a FORM with decimal inputs (%.2f), no cursor jumping; 'Apply thresholds' to commit.
+# - Absolute mode: plain text inputs per selected metric (no +/-), shown only when checkbox is ticked.
 # - Drops 'Unnamed: 0' and blank columns.
 # - Excel writer: try openpyxl/xlsxwriter; fallback to CSV downloads if neither is available.
 
@@ -77,17 +77,6 @@ auto_run = st.checkbox("Auto-run on changes", value=True)
 run_clicked = st.button("Run")
 
 # =========================
-# Absolute-mode form state init (for smooth typing)
-# =========================
-if use_absolute and metric_catalog and "abs_state_initialized" not in st.session_state:
-    for name, direction, vtype in metric_catalog:
-        # defaults: 95.00 for percent, 60.00 for number
-        default_val = 95.00 if vtype == "percent" else 60.00
-        st.session_state.setdefault(f"abs_chk_{name}", False)
-        st.session_state.setdefault(f"abs_thr_{name}", float(default_val))
-    st.session_state["abs_state_initialized"] = True
-
-# =========================
 # Comparative (default) UI
 # =========================
 if not use_absolute:
@@ -103,45 +92,59 @@ if not use_absolute:
         st.error("Invalid metric order input; use numbers like 1,2,14")
     selected_metrics = [(metric_catalog[i][0], metric_catalog[i][1]) for i in selected_indices if 0 <= i < len(metric_catalog)]
 else:
-    # ===== Absolute thresholds mode: FORM (no reruns while typing) =====
-    st.markdown("**Absolute thresholds mode** — select metrics and set required thresholds.")
-    with st.form("abs_form", clear_on_submit=False):
-        left, right = st.columns(2)
-        half = (len(metric_catalog) + 1) // 2
-        for i, (name, direction, vtype) in enumerate(metric_catalog):
-            container = left if i < half else right
-            with container:
-                st.checkbox(
-                    f"{name} ({'higher' if direction=='higher' else 'lower'} is better)",
-                    key=f"abs_chk_{name}"
-                )
-                # Decimal inputs with two fixed decimals; step=0.01; no rerun until submit
-                st.number_input(
-                    f"Threshold • {name}",
-                    value=float(st.session_state.get(f"abs_thr_{name}", 95.00 if vtype=='percent' else 60.00)),
-                    step=0.01,
-                    format="%.2f",
-                    key=f"abs_thr_{name}"
-                )
-        applied = st.form_submit_button("Apply thresholds")
-        if applied:
-            # Store consolidated selections in session_state
-            abs_selected = []
-            abs_thresholds = {}
-            for name, direction, vtype in metric_catalog:
-                if st.session_state.get(f"abs_chk_{name}", False):
-                    abs_selected.append((name, direction))
-                    abs_thresholds[name] = float(st.session_state.get(f"abs_thr_{name}", 0.0))
-            st.session_state["abs_selected"] = abs_selected
-            st.session_state["abs_thresholds"] = abs_thresholds
+    # ===== Absolute thresholds mode: plain text fields shown only when metric is checked =====
+    st.markdown("**Absolute thresholds mode** — tick metrics and type thresholds (free text, decimals allowed, `%` optional).")
 
-    # Read latest applied state (if none yet, fall back to current widgets’ state)
-    selected_metrics = st.session_state.get("abs_selected", [])
-    metric_thresholds = st.session_state.get(
-        "abs_thresholds",
-        {name: float(st.session_state.get(f"abs_thr_{name}", 95.00 if vt=='percent' else 60.00))
-         for name, _d, vt in metric_catalog if st.session_state.get(f"abs_chk_{name}", False)}
-    )
+    # initialize session defaults once
+    if "abs_init_done" not in st.session_state:
+        for name, direction, vtype in metric_catalog:
+            st.session_state.setdefault(f"abs_chk_{name}", False)
+            st.session_state.setdefault(f"abs_txt_{name}", "95.00" if vtype == "percent" else "60.00")
+        st.session_state["abs_init_done"] = True
+
+    abs_selected, abs_thresholds = [], {}
+    left, right = st.columns(2)
+    half = (len(metric_catalog) + 1) // 2
+
+    def parse_threshold_str(s: str, vtype: str):
+        if s is None:
+            return None
+        s = str(s).strip()
+        if s == "":
+            return None
+        s = s.replace("%", "").replace(",", "")
+        try:
+            val = float(s)
+        except Exception:
+            return None
+        # soft guard for percents
+        if vtype == "percent" and (val < 0 or val > 100):
+            return None
+        return val
+
+    for i, (name, direction, vtype) in enumerate(metric_catalog):
+        container = left if i < half else right
+        with container:
+            st.checkbox(
+                f"{name} ({'higher' if direction=='higher' else 'lower'} is better)",
+                key=f"abs_chk_{name}"
+            )
+            if st.session_state.get(f"abs_chk_{name}", False):
+                st.text_input(
+                    f"Threshold • {name}",
+                    key=f"abs_txt_{name}",
+                    placeholder="e.g., 95 or 95.00" if vtype == "percent" else "e.g., 60 or 60.00",
+                )
+                # build selections as you type; no +/- controls, plain text only
+                val = parse_threshold_str(st.session_state.get(f"abs_txt_{name}", ""), vtype)
+                if val is not None:
+                    abs_selected.append((name, direction))
+                    abs_thresholds[name] = float(val)
+                else:
+                    st.caption(":red[Enter a valid number{}]".format(" (0–100)" if vtype == "percent" else ""))
+
+    selected_metrics = abs_selected
+    metric_thresholds = abs_thresholds
 
 st.divider()
 
@@ -197,7 +200,6 @@ def prep(df: pd.DataFrame, product_cfg: dict) -> pd.DataFrame:
             else:
                 df[name] = pd.to_numeric(df[name], errors="coerce")
 
-    # Also drop any lingering Unnamed/blank after cleaning
     df = drop_unwanted_columns(df)
     return df
 
@@ -408,7 +410,7 @@ def compute_and_show():
         return
 
     if use_absolute and len(selected_metrics) == 0:
-        st.info("Select metrics and click 'Apply thresholds' in Absolute mode.")
+        st.info("Tick metrics and type thresholds in Absolute mode.")
         return
     if (not use_absolute) and len(selected_metrics) == 0:
         st.info("Enter a valid metric priority order with at least one metric.")
@@ -485,15 +487,3 @@ def compute_and_show():
 
 if auto_run or run_clicked:
     compute_and_show()
-
-with st.expander("How to add/modify a product (Parcel/Ocean/etc.)"):
-    st.markdown(
-        """
-1. Edit the `PRODUCTS` dict at the top.
-2. For each product, add tuples to `metrics`: `(Display Name, direction, value_type)`.
-   - `direction`: `"higher"` or `"lower"`
-   - `value_type`: `"percent"` (strips `%` and coerces) or `"number"`
-3. Ensure your CSVs use the **exact column names** from `metrics` and include `Carrier Name` (or change `carrier_col`).
-4. (Optional) Set `volume_col` if you want it cleaned for consistency or future sorting.
-"""
-    )
