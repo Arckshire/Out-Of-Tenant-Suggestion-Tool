@@ -1,9 +1,10 @@
 # streamlit_app.py
-# Multi-product Streamlit app (Last Mile ready).
-# - Comparative mode: ANY-per-metric (your original), adds Δ in Reasons.
-# - Absolute mode: plain text inputs per selected metric (no +/-), shown only when checkbox is ticked.
-# - Drops 'Unnamed: 0' and blank columns.
-# - Excel writer: try openpyxl/xlsxwriter; fallback to CSV downloads if neither is available.
+# Multi-product Streamlit app (Last Mile, Parcel, Ocean).
+# - Comparative mode: ANY-per-metric (original LM behavior), Reasons include Δ vs matched customer.
+# - Absolute mode: plain text threshold inputs (no +/-), shown only when metric is checked; equality toggle.
+# - Per-control and per-metric hover tooltips.
+# - Drops 'Unnamed: 0' and blank headers from inputs/outputs.
+# - Excel writer: try openpyxl/xlsxwriter; fallback to CSV downloads if neither installed.
 
 import streamlit as st
 import pandas as pd
@@ -14,40 +15,125 @@ import re
 # =========================
 # Product Config (EDIT ME)
 # =========================
+# Metric tuple: (display_name, direction, value_type[, help_text])
+#   direction: "higher" | "lower"
+#   value_type: "percent" | "number"
 PRODUCTS = {
     "Last Mile": {
         "metrics": [
-            ("Data Availability", "higher", "percent"),
-            ("Milestone Completeness", "higher", "percent"),
-            ("Scheduled Milestone Completeness", "higher", "percent"),
-            ("Out for Delivery Milestone Completeness", "higher", "percent"),
-            ("In Transit Milestone Completeness", "higher", "percent"),
-            ("Delivered Milestone Completeness", "higher", "percent"),
-            ("Latency under 1 hr", "lower", "percent"),
-            ("Latency under 2 hr", "lower", "percent"),
-            ("Latency bw 1-3 hrs", "lower", "percent"),
-            ("Latency bw 3-8 hrs", "lower", "percent"),
-            ("Latency bw 8-24hrs", "lower", "percent"),
-            ("Latency bw 24-72hrs", "lower", "percent"),
-            ("Latency over 72hrs", "lower", "percent"),
-            ("Avg Latency Mins", "lower", "number"),
+            ("Data Availability", "higher", "percent", "Percent of shipments with any usable tracking data present."),
+            ("Milestone Completeness", "higher", "percent", "Percent of expected milestones received for the shipment."),
+            ("Scheduled Milestone Completeness", "higher", "percent", "Percent of scheduled milestones received (planned events)."),
+            ("Out for Delivery Milestone Completeness", "higher", "percent", "Percent of OOD milestones received when applicable."),
+            ("In Transit Milestone Completeness", "higher", "percent", "Percent of in-transit milestones received."),
+            ("Delivered Milestone Completeness", "higher", "percent", "Percent of delivered milestones received / completed."),
+            ("Latency under 1 hr", "lower", "percent", "Share of milestone latencies that are under 1 hour (lower buckets dominate = better timeliness)."),
+            ("Latency under 2 hr", "lower", "percent", "Share of milestone latencies under 2 hours."),
+            ("Latency bw 1-3 hrs", "lower", "percent", "Share of milestone latencies between 1–3 hours."),
+            ("Latency bw 3-8 hrs", "lower", "percent", "Share of milestone latencies between 3–8 hours."),
+            ("Latency bw 8-24hrs", "lower", "percent", "Share of milestone latencies between 8–24 hours."),
+            ("Latency bw 24-72hrs", "lower", "percent", "Share of milestone latencies between 24–72 hours."),
+            ("Latency over 72hrs", "lower", "percent", "Share of milestone latencies over 72 hours."),
+            ("Avg Latency Mins", "lower", "number", "Average latency across milestones in minutes (lower is better)."),
         ],
         "volume_col": "Volume",
         "carrier_col": "Carrier Name",
+        "help": {
+            "product": "Run the same logic for different products; only the metric columns change.",
+            "master": "The complete list of p44 carriers for the selected product, with performance metrics.",
+            "customer": "Carriers that your customer already uses (the comparison baseline).",
+            "use_absolute": "Switch to threshold mode. In comparative mode, a candidate passes each metric if it beats/ties ANY customer carrier on that metric.",
+            "allow_equal_abs": "When ON, threshold comparisons allow equality (≥ for higher-is-better; ≤ for lower-is-better).",
+            "num_suggestions": "How many suggested carriers to include in the final output.",
+            "order_input": "Priority order for metrics (1 = highest). Candidate must pass each metric in this order vs at least one customer carrier.",
+        },
     },
-    # Fill when ready:
-    "Parcel": {"metrics": [], "volume_col": "Volume", "carrier_col": "Carrier Name"},
-    "Ocean":  {"metrics": [], "volume_col": "Volume", "carrier_col": "Carrier Name"},
+
+    # ===== Parcel (your schema) =====
+    "Parcel": {
+        "metrics": [
+            ("Data Availability", "higher", "percent", "Percent of parcel shipments with any usable tracking data."),
+            ("Milestone Achieved %", "higher", "percent", "Percent of expected milestone events successfully recorded."),
+            ("Latency Percentage", "higher", "percent", "Percent of milestones within your acceptable latency window."),
+            ("Pickup Milestone", "higher", "percent", "Percent of shipments with a pickup milestone received."),
+            ("Departed Milestone", "higher", "percent", "Percent of shipments with a departure milestone received."),
+            ("Out for Delivery Milestone", "higher", "percent", "Percent of shipments with OOD milestone received."),
+            ("Arrived Milestone", "higher", "percent", "Percent of shipments with arrival milestone received."),
+            ("Delivered Milestone", "higher", "percent", "Percent of shipments with delivered milestone received."),
+            ("Volume Tracked", "higher", "number", "Count of shipments tracked (higher indicates broader coverage)."),
+            ("Impact - Milestone Achieved %", "higher", "number", "Estimated incremental improvement for Milestone Achieved %."),
+            ("Impact - Latency Percentage", "higher", "number", "Estimated incremental improvement for Latency Percentage."),
+            ("Impact - Data Availability", "higher", "number", "Estimated incremental improvement for Data Availability."),
+        ],
+        "volume_col": "Volume Created",
+        "carrier_col": "Carrier Name",
+        "help": {
+            "product": "Parcel carriers & parcel metrics.",
+            "master": "All parcel carriers with performance metrics (MASTER).",
+            "customer": "Parcel carriers your customer already uses (CUSTOMER).",
+            "use_absolute": "Switch to threshold mode with your typed targets per metric.",
+            "allow_equal_abs": "Count equals as meeting the threshold.",
+            "num_suggestions": "How many suggestions to output.",
+            "order_input": "Priority order for parcel metrics.",
+        },
+    },
+
+    # ===== Ocean (your schema) =====
+    "Ocean": {
+        "metrics": [
+            ("Completeness 6 - p44", "higher", "percent", "Coverage of 6 standard ocean events in p44."),
+            ("Completeness 8 - p44", "higher", "percent", "Coverage of 8 standard ocean events in p44."),
+            ("p44 6 Uplift", "higher", "number", "Incremental coverage uplift vs baseline (6-event set)."),
+            ("p44 8 Uplift", "higher", "number", "Incremental coverage uplift vs baseline (8-event set)."),
+            ("1-Empty Pickup %", "higher", "percent", "Share of containers with Empty Pickup milestone."),
+            ("2-Gate In %", "higher", "percent", "Share with Gate In milestone."),
+            ("3-Container Loaded %", "higher", "percent", "Share with Container Loaded milestone."),
+            ("4-Vessel Depart POL - p44", "higher", "percent", "Share with Vessel Departure at POL milestone (p44 signal)."),
+            ("5-Vessel Arrival POD - p44", "higher", "percent", "Share with Vessel Arrival at POD milestone (p44 signal)."),
+            ("6-Container Discharge POD %", "higher", "percent", "Share with Container Discharge at POD milestone."),
+            ("7-Gate Out %", "higher", "percent", "Share with Gate Out milestone."),
+            ("8-Empty Return %", "higher", "percent", "Share with Empty Return milestone."),
+            ("Arrival at POD Uplift", "higher", "number", "Incremental arrival event coverage uplift (all-time)."),
+            ("Departure from POL Uplift", "higher", "number", "Incremental departure event coverage uplift (all-time)."),
+            ("Under 6h - p44", "higher", "percent", "Share of latency under 6 hours (p44 signal)."),
+            ("Under 12h - p44", "higher", "percent", "Share of latency under 12 hours (p44 signal)."),
+            ("Under 24h- p44", "higher", "percent", "Share of latency under 24 hours (p44 signal)."),
+            ("24-48h Latency - p44", "higher", "percent", "Share of latency 24–48 hours (p44 signal)."),
+            ("48-72h Latency - p44", "higher", "percent", "Share of latency 48–72 hours (p44 signal)."),
+            ("Over 72h - p44", "higher", "percent", "Share of latency over 72 hours (p44 signal)."),
+            ("Departure from POL - p44 Uplift (<12)", "higher", "number", "Departure event coverage uplift with <12h latency."),
+            ("Arrival at POD - p44 Uplift (<12)", "higher", "number", "Arrival event coverage uplift with <12h latency."),
+        ],
+        "volume_col": "Shipments",
+        "carrier_col": "Carrier Name",
+        "help": {
+            "product": "Ocean carriers & ocean metrics.",
+            "master": "All ocean carriers with performance metrics (MASTER).",
+            "customer": "Ocean carriers your customer already uses (CUSTOMER).",
+            "use_absolute": "Switch to threshold mode with your typed targets per metric.",
+            "allow_equal_abs": "Count equals as meeting the threshold.",
+            "num_suggestions": "How many suggestions to output.",
+            "order_input": "Priority order for ocean metrics.",
+        },
+    },
 }
 
 # =========================
-# App Shell
+# Page shell
 # =========================
 st.set_page_config(page_title="Carrier Suggestion Hub", layout="wide")
 st.title("Carrier Recommendation Hub")
 st.caption("Pick a product, upload MASTER & CUSTOMER CSVs, and generate out-of-tenant suggestions.")
 
-product = st.selectbox("Choose Product", options=list(PRODUCTS.keys()), index=0)
+def get_help(prod_key: str, field: str, default: str = "") -> str:
+    return PRODUCTS.get(prod_key, {}).get("help", {}).get(field, default)
+
+product = st.selectbox(
+    "Choose Product",
+    options=list(PRODUCTS.keys()),
+    index=0,
+    help=get_help("Last Mile", "product", "Select which product’s metrics to use.")
+)
 cfg = PRODUCTS[product]
 metric_catalog = cfg["metrics"]
 carrier_col = cfg["carrier_col"]
@@ -62,16 +148,38 @@ st.divider()
 # Uploads
 # =========================
 st.header("1) Upload Files")
-master_file = st.file_uploader("Upload MASTER dataset (all p44 carriers)", type=["csv"], key="master")
-customer_file = st.file_uploader("Upload CUSTOMER carrier dataset (already used carriers)", type=["csv"], key="customer")
+master_file = st.file_uploader(
+    "Upload MASTER dataset (all p44 carriers)",
+    type=["csv"],
+    key="master",
+    help=get_help(product, "master", "MASTER: full carrier list for the product (with metrics).")
+)
+customer_file = st.file_uploader(
+    "Upload CUSTOMER carrier dataset (already used carriers)",
+    type=["csv"],
+    key="customer",
+    help=get_help(product, "customer", "CUSTOMER: carriers your customer already uses (comparison baseline).")
+)
 
 # =========================
 # Parameters
 # =========================
 st.header("2) Parameters")
-use_absolute = st.checkbox("Use absolute thresholds mode (override comparative logic)", value=False)
-allow_equal_abs = st.checkbox("Absolute mode: allow equals to pass", value=True, help="When ON, ≥ for higher metrics and ≤ for lower metrics.")
-num_suggestions = st.number_input("How many top suggestions do you want?", min_value=1, value=10, step=1, format="%d")
+use_absolute = st.checkbox(
+    "Use absolute thresholds mode (override comparative logic)",
+    value=False,
+    help=get_help(product, "use_absolute", "Type numeric targets per metric; suggestions must meet them.")
+)
+allow_equal_abs = st.checkbox(
+    "Absolute mode: allow equals to pass",
+    value=True,
+    help=get_help(product, "allow_equal_abs", "When ON, thresholds allow equality (≥ higher-is-better; ≤ lower-is-better).")
+)
+num_suggestions = st.number_input(
+    "How many top suggestions do you want?",
+    min_value=1, value=10, step=1, format="%d",
+    help=get_help(product, "num_suggestions", "How many suggested carriers to include in the output.")
+)
 
 auto_run = st.checkbox("Auto-run on changes", value=True)
 run_clicked = st.button("Run")
@@ -80,63 +188,73 @@ run_clicked = st.button("Run")
 # Comparative (default) UI
 # =========================
 if not use_absolute:
-    metric_labels = [f"{i+1}. {name} ({direction})" for i, (name, direction, _vt) in enumerate(metric_catalog)]
-    st.markdown("**Select metric priority order.** Enter numbers in comma-separated order (e.g., `1,2,14`):")
+    metric_labels = [f"{i+1}. {name} ({direction})" for i, (name, direction, *_rest) in enumerate(metric_catalog)]
+    st.markdown("**Select metric priority order.** Enter numbers in comma-separated order (e.g., `1,2,3`):")
     st.text("\n".join(metric_labels))
     default_order = ",".join(str(i+1) for i in range(min(3, len(metric_catalog)))) if metric_catalog else ""
-    order_input = st.text_input("Metric priority order", value=default_order)
+    order_input = st.text_input(
+        "Metric priority order",
+        value=default_order,
+        help=get_help(product, "order_input", "Priority order of metrics for comparative (cascading) logic.")
+    )
     selected_indices = []
     try:
         selected_indices = [int(x.strip()) - 1 for x in order_input.split(",") if x.strip()]
     except Exception:
-        st.error("Invalid metric order input; use numbers like 1,2,14")
+        st.error("Invalid metric order input; use numbers like 1,2,3")
+    # (col, direction)
     selected_metrics = [(metric_catalog[i][0], metric_catalog[i][1]) for i in selected_indices if 0 <= i < len(metric_catalog)]
 else:
-    # ===== Absolute thresholds mode: plain text fields shown only when metric is checked =====
+    # ===== Absolute thresholds mode: plain text inputs, shown only when checked =====
     st.markdown("**Absolute thresholds mode** — tick metrics and type thresholds (free text, decimals allowed, `%` optional).")
 
-    # initialize session defaults once
-    if "abs_init_done" not in st.session_state:
-        for name, direction, vtype in metric_catalog:
-            st.session_state.setdefault(f"abs_chk_{name}", False)
-            st.session_state.setdefault(f"abs_txt_{name}", "95.00" if vtype == "percent" else "60.00")
-        st.session_state["abs_init_done"] = True
+    # initialize defaults for current product once per session
+    prod_key = f"abs_init__{product}"
+    if prod_key not in st.session_state:
+        for name, direction, vtype, *_h in metric_catalog:
+            st.session_state.setdefault(f"abs_chk__{product}__{name}", False)
+            st.session_state.setdefault(f"abs_txt__{product}__{name}", "95.00" if vtype == "percent" else "60.00")
+        st.session_state[prod_key] = True
 
     abs_selected, abs_thresholds = [], {}
     left, right = st.columns(2)
     half = (len(metric_catalog) + 1) // 2
 
     def parse_threshold_str(s: str, vtype: str):
-        if s is None:
-            return None
+        if s is None: return None
         s = str(s).strip()
-        if s == "":
-            return None
+        if s == "": return None
         s = s.replace("%", "").replace(",", "")
         try:
             val = float(s)
         except Exception:
             return None
-        # soft guard for percents
         if vtype == "percent" and (val < 0 or val > 100):
             return None
         return val
 
-    for i, (name, direction, vtype) in enumerate(metric_catalog):
+    for i, entry in enumerate(metric_catalog):
+        # Support both 3-tuple and 4-tuple entries
+        if len(entry) == 4:
+            name, direction, vtype, m_help = entry
+        else:
+            name, direction, vtype = entry
+            m_help = ""
         container = left if i < half else right
         with container:
             st.checkbox(
                 f"{name} ({'higher' if direction=='higher' else 'lower'} is better)",
-                key=f"abs_chk_{name}"
+                key=f"abs_chk__{product}__{name}",
+                help=m_help
             )
-            if st.session_state.get(f"abs_chk_{name}", False):
+            if st.session_state.get(f"abs_chk__{product}__{name}", False):
                 st.text_input(
                     f"Threshold • {name}",
-                    key=f"abs_txt_{name}",
-                    placeholder="e.g., 95 or 95.00" if vtype == "percent" else "e.g., 60 or 60.00",
+                    key=f"abs_txt__{product}__{name}",
+                    placeholder=("e.g., 95 or 95.00" if vtype == "percent" else "e.g., 60 or 60.00"),
+                    help=f"Type a number{ ' between 0 and 100' if vtype=='percent' else '' }. '%' allowed."
                 )
-                # build selections as you type; no +/- controls, plain text only
-                val = parse_threshold_str(st.session_state.get(f"abs_txt_{name}", ""), vtype)
+                val = parse_threshold_str(st.session_state.get(f"abs_txt__{product}__{name}", ""), vtype)
                 if val is not None:
                     abs_selected.append((name, direction))
                     abs_thresholds[name] = float(val)
@@ -193,7 +311,8 @@ def prep(df: pd.DataFrame, product_cfg: dict) -> pd.DataFrame:
         )
 
     # Clean configured metric columns
-    for name, _direction, vtype in product_cfg["metrics"]:
+    for entry in product_cfg["metrics"]:
+        name, _direction, vtype = entry[:3]
         if name in df.columns:
             if vtype == "percent":
                 df[name] = df[name].apply(clean_percent)
@@ -313,6 +432,7 @@ def make_output_absolute_thresholds(master_df, customer_df, metrics_with_dir, th
 
     unused = master_df[~master_df[carrier_col_name].str.lower().isin(customer_df[carrier_col_name].str.lower())].copy()
 
+    # Identify "bad" customer carriers (fail thresholds)
     bad_rows = []
     for _, crow in customer_df.iterrows():
         fail = False
@@ -423,8 +543,8 @@ def compute_and_show():
         st.error(f"Both files must include a `{carrier_col}` column.")
         return
 
-    missing_in_master = [m[0] for m in metric_catalog if (m[0] not in master_df.columns)]
-    missing_in_customer = [m[0] for m in metric_catalog if (m[0] not in customer_df.columns)]
+    missing_in_master = [entry[0] for entry in metric_catalog if (entry[0] not in master_df.columns)]
+    missing_in_customer = [entry[0] for entry in metric_catalog if (entry[0] not in customer_df.columns)]
     if missing_in_master:
         st.warning(f"MASTER missing columns (not fatal if not selected): {', '.join(missing_in_master)}")
     if missing_in_customer:
@@ -454,7 +574,7 @@ def compute_and_show():
 
         legend_rows = [
             ["Column", "Explanation"],
-            ["Carrier N", "Customer carrier outperformed (comparative mode) or compared against (absolute mode)."],
+            ["Carrier N", "Customer carrier outperformed (comparative) or compared against (absolute)."],
             ["Reason N", "Metrics with tags: (B)=Better, (E)=Equal; Δ shows improvement vs that customer (positive is better)."]
         ]
         legend_df = pd.DataFrame(legend_rows[1:], columns=legend_rows[0])
@@ -485,5 +605,6 @@ def compute_and_show():
                 mime="text/csv"
             )
 
+# Auto-run or manual run
 if auto_run or run_clicked:
     compute_and_show()
